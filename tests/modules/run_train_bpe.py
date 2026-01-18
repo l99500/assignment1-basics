@@ -65,4 +65,11 @@ def run_train_bpe(
         new_word_counts = Counter()
         for item, count in word_counts.items():
             tmp_list = []
-            pass
+            for i_new_item in range(len(item)-1):
+                item_current, item_next = item[i_new_item], item[i_new_item+1]
+                if item_current+item_next == max_bigram:
+                    tmp_list.append(max_bigram)
+                else:
+                    tmp_list.extend([item_current, item_next])
+            new_word_counts[tuple(tmp_list)] = count
+        word_counts = new_word_counts
