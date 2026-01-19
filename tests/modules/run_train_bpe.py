@@ -135,39 +135,12 @@ def run_train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
-    # ==========================================
-    # 1. 初始化词表 (Vocabulary Initialization)
-    # ==========================================
-    # 词表：ID -> Bytes
-    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     
-    # 倒排索引：Bytes -> ID (方便后续查找)
-    vocab_inv: dict[bytes, int] = {bytes([i]): i for i in range(256)}
-
-    # 处理 Special Tokens
-    # 注意：Special Tokens 直接加入词表，不参与 BPE 合并运算，但在分词时要保留
-    sorted_special_tokens = sorted(special_tokens, key=len, reverse=True) # 长词优先匹配
+    # 1. 初始化 Vocab
+    vocab = {i: bytes([i]) for i in range(256)}
+    vocab_inv = {bytes([i]): i for i in range(256)}
+    
+    sorted_special_tokens = sorted(special_tokens, key=len, reverse=True)
     for st in special_tokens:
         st_bytes = st.encode("utf-8")
         if st_bytes not in vocab_inv:
@@ -175,114 +148,83 @@ def run_train_bpe(
             vocab[new_id] = st_bytes
             vocab_inv[st_bytes] = new_id
 
-    # ==========================================
-    # 2. 预分词与统计 (Pre-tokenization & Loading)
-    # ==========================================
-    # 我们使用一个字典来存储所有单词的 Token ID 序列及其出现频率
-    # 结构: { (id1, id2, id3...): count }
-    # 这样可以极大压缩数据量，后续循环只需要遍历这个字典，不需要遍历原始文本
-    train_data: dict[tuple[int, ...], int] = Counter()
+    # 2. 准备正则 (GPT-2 标准正则)
+    GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    tokenizer_regex = re.compile(GPT2_SPLIT_PATTERN)
 
-    # GPT-2 的标准正则
-    # 这里的正则将文本切分为：缩写、单词、数字、非空白符号、空白符
-    pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    regex = re.compile(pat_str)
-
-    # 构造 Special Token 切分正则：(st1|st2|...)
+    # Special Token 切分正则
     if sorted_special_tokens:
         st_pattern = "(" + "|".join(re.escape(t) for t in sorted_special_tokens) + ")"
     else:
         st_pattern = None
 
-    print(f"Loading data from {input_path}...")
+    train_data = Counter()
+
+    # 3. 读取数据 (使用 f.read() 确保跨行匹配正确)
     with open(input_path, "r", encoding="utf-8") as f:
-        for line in f:
-            # 第一步：先用 Special Tokens 切开，保护它们不被后续正则打碎
-            if st_pattern:
-                parts = re.split(st_pattern, line)
-            else:
-                parts = [line]
+        text = f.read()
+        
+        # A. 先切分 Special Tokens
+        if st_pattern:
+            parts = re.split(st_pattern, text)
+        else:
+            parts = [text]
 
-            for part in parts:
-                # 如果是 Special Token，跳过 BPE 统计（它们单独存在）
-                if part in special_tokens:
-                    continue
-                if not part:
-                    continue
+        for part in parts:
+            if part in special_tokens:
+                continue
+            if not part:
+                continue
+            
+            # B. 运行 GPT-2 正则
+            chunks = re.findall(tokenizer_regex, part)
 
-                # 第二步：对普通文本运行 GPT-2 正则
-                chunks = re.findall(regex, part)
-
-                # 第三步：将每个 Chunk 转换为初始的 ID 列表 (Byte IDs)
-                for chunk in chunks:
-                    chunk_bytes = chunk.encode("utf-8")
-                    # 将 bytes 转为整数 tuple: b'abc' -> (97, 98, 99)
-                    ids = tuple(chunk_bytes) 
-                    train_data[ids] += 1
-
-    print(f"Data loaded. Unique words: {len(train_data)}")
-
-    # ==========================================
-    # 3. BPE 训练循环 (Training Loop)
-    # ==========================================
-    merges: list[tuple[bytes, bytes]] = []
-
-    # 循环直到词表填满
+            for chunk in chunks:
+                chunk_bytes = chunk.encode("utf-8")
+                ids = tuple(chunk_bytes) 
+                train_data[ids] += 1
+    
+    # 4. BPE 循环
+    merges = []
     while len(vocab) < vocab_size:
-        # A. 统计当前所有 pair 的频率
         stats = Counter()
         for ids, count in train_data.items():
-            # 遍历当前单词内的所有相邻 pair
             for i in range(len(ids) - 1):
                 pair = (ids[i], ids[i+1])
                 stats[pair] += count
 
-        # 如果没有 pair 了（所有词都合并完了），提前退出
         if not stats:
             break
 
-        # B. 找到频率最高的 Pair
-        # 评判标准：1. 频率最高 (stats[p])  2. 字典序最大 (p)
-        # 注意：Python tuple 比较是逐位的，(100, 200) > (100, 199)，符合字节序要求
-        best_pair = max(stats, key=lambda p: (stats[p], p))
-
-        # C. 执行合并 (Merge)
-        # 1. 在词表中注册新 Token
-        new_id = len(vocab)
-        token_bytes_0 = vocab[best_pair[0]]
-        token_bytes_1 = vocab[best_pair[1]]
-        new_token_bytes = token_bytes_0 + token_bytes_1
+        # =========================================================
+        # 关键修正：Tie-Breaking 使用 Bytes 内容比较，而不是 ID
+        # =========================================================
+        best_pair = max(stats, key=lambda p: (stats[p], vocab[p[0]], vocab[p[1]]))
         
-        vocab[new_id] = new_token_bytes
-        merges.append((token_bytes_0, token_bytes_1))
+        # Merge 操作
+        new_id = len(vocab)
+        part1 = vocab[best_pair[0]]
+        part2 = vocab[best_pair[1]]
+        vocab[new_id] = part1 + part2
+        merges.append((part1, part2))
 
-        # 2. 更新训练数据 (将 best_pair 替换为 new_id)
-        #    这里不重新扫描，而是构建一个新的字典
+        # 更新 train_data
         new_train_data = {}
         for ids, count in train_data.items():
-            # 如果这个单词里根本没有 best_pair 的这两个 ID，直接跳过处理，原样复制
-            # 这是一个简单的加速检查
             if best_pair[0] not in ids:
                 new_train_data[ids] = count
                 continue
-
-            # 开始替换逻辑
+            
             new_ids = []
             i = 0
             while i < len(ids):
-                # 检查是否匹配 best_pair
                 if i < len(ids) - 1 and ids[i] == best_pair[0] and ids[i+1] == best_pair[1]:
                     new_ids.append(new_id)
-                    i += 2 # 跳过两个
+                    i += 2
                 else:
                     new_ids.append(ids[i])
                     i += 1
             new_train_data[tuple(new_ids)] = count
-        
         train_data = new_train_data
-
-        # 打印进度 (可选)
-        if len(vocab) % 100 == 0:
-            print(f"Vocab size: {len(vocab)} / {vocab_size}, Merged: {best_pair} -> {new_id}")
 
     return vocab, merges
