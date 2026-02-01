@@ -211,6 +211,7 @@ def run_train_bpe(
         # 更新 train_data
         new_train_data = {}
         for ids, count in train_data.items():
+            # 快速筛选
             if best_pair[0] not in ids:
                 new_train_data[ids] = count
                 continue
